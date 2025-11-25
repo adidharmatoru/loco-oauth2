@@ -362,6 +362,9 @@ pub trait GrantTrait: Send + Sync {
             .http_client
             .get(client.profile_url.clone())
             .bearer_auth(token.access_token().secret().to_owned())
+            .header("User-Agent", "reqwest")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")  
             .send()
             .await
             .map_err(OAuth2ClientError::ProfileError)?;
