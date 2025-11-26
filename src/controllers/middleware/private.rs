@@ -11,7 +11,6 @@ use axum_extra::extract;
 use cookie::{Cookie, Key};
 use http::HeaderMap;
 use loco_rs::prelude::AppContext;
-use oauth2::basic::BasicTokenResponse;
 use oauth2::TokenResponse;
 use std::convert::Infallible;
 
@@ -76,23 +75,23 @@ pub trait OAuth2PrivateCookieJarTrait: Clone {
     ///
     /// # Arguments
     /// * `config` - `AuthorizationCodeCookieConfig` - The cookie configuration
-    /// * `token` - `BasicTokenResponse` - The token response
+    /// * `token` - `impl TokenResponse` - The token response (any type implementing TokenResponse)
     /// * `jar` - `OAuth2PrivateCookieJar` - The cookie jar
     /// # Returns
     /// * `OAuth2PrivateCookieJar` - The cookie jar with the added cookie
     /// # Errors
     /// * `Error` - When the cookie cannot be created
-    fn create_short_live_cookie_with_token_response(
+    fn create_short_live_cookie_with_token_response<R: TokenResponse>(
         config: &CookieConfig,
-        token: &BasicTokenResponse,
+        token: &R,
         jar: Self,
     ) -> Result<Self, Box<loco_rs::errors::Error>>;
 }
 
 impl OAuth2PrivateCookieJarTrait for OAuth2PrivateCookieJar {
-    fn create_short_live_cookie_with_token_response(
+    fn create_short_live_cookie_with_token_response<R: TokenResponse>(
         config: &CookieConfig,
-        token: &BasicTokenResponse,
+        token: &R,
         jar: Self,
     ) -> Result<Self, Box<loco_rs::errors::Error>> {
         // Set the cookie

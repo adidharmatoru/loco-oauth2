@@ -1,5 +1,5 @@
 use loco_rs::prelude::*;
-use oauth2::basic::BasicTokenResponse;
+use oauth2::TokenResponse;
 use sea_orm::DatabaseConnection;
 
 /// Trait for OAuth2 sessions.
@@ -21,15 +21,15 @@ pub trait OAuth2SessionsTrait<T>: Clone {
     ///
     /// # Arguments
     /// db: &`DatabaseConnection` - Database connection
-    /// token: &`BasicTokenResponse` - OAuth token
+    /// token: &impl `TokenResponse` - OAuth token (any type implementing TokenResponse)
     /// user: &`users::Model` - User
     /// # Returns
     /// A session
     /// # Errors
     /// Returns a `ModelError` if the session cannot be upserted
-    async fn upsert_with_oauth2(
+    async fn upsert_with_oauth2<R: TokenResponse + Sync>(
         db: &DatabaseConnection,
-        token: &BasicTokenResponse,
+        token: &R,
         user: &T,
     ) -> ModelResult<Self>;
 }

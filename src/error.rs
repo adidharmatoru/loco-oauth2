@@ -65,8 +65,10 @@ pub enum OAuth2ClientError {
     BasicTokenError(#[from] BasicTokenError),
     #[error("CSRF token error")]
     CsrfTokenError,
-    #[error("Profile error")]
+    #[error("Profile error: {0}")]
     ProfileError(reqwest::Error),
+    #[error("Profile processing error: {0}")]
+    ProfileProcessingError(String),
     #[error("Configuration error")]
     ConfigError(#[from] oauth2::ConfigurationError),
 }

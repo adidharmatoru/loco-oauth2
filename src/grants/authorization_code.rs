@@ -9,13 +9,68 @@ use oauth2::{
     basic::{BasicClient, BasicTokenResponse},
     url,
     url::Url,
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    StandardRevocableToken, TokenResponse, TokenUrl,
+    AccessToken, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    Scope, StandardRevocableToken, TokenResponse, TokenUrl,
 };
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+
+/// A wrapper around `BasicTokenResponse` that provides a default expiry
+/// when the OAuth provider doesn't return `expires_in` (e.g., GitHub).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenResponseWithDefaults {
+    #[serde(flatten)]
+    inner: BasicTokenResponse,
+    #[serde(skip)]
+    default_expiry: Option<std::time::Duration>,
+}
+
+impl TokenResponseWithDefaults {
+    /// Create a new wrapper with the token response and optional default expiry.
+    pub fn new(token: BasicTokenResponse, default_expiry: Option<std::time::Duration>) -> Self {
+        Self {
+            inner: token,
+            default_expiry,
+        }
+    }
+
+    /// Get the underlying token response.
+    pub fn inner(&self) -> &BasicTokenResponse {
+        &self.inner
+    }
+
+    /// Get expires_in, falling back to default_expiry if not provided by the OAuth server.
+    pub fn expires_in_or_default(&self) -> Option<std::time::Duration> {
+        self.inner.expires_in().or(self.default_expiry)
+    }
+}
+
+// Implement TokenResponse trait to make it easy to use
+impl TokenResponse for TokenResponseWithDefaults {
+    type TokenType = <BasicTokenResponse as TokenResponse>::TokenType;
+
+    fn access_token(&self) -> &AccessToken {
+        self.inner.access_token()
+    }
+
+    fn token_type(&self) -> &Self::TokenType {
+        self.inner.token_type()
+    }
+
+    fn expires_in(&self) -> Option<std::time::Duration> {
+        self.expires_in_or_default()
+    }
+
+    fn refresh_token(&self) -> Option<&RefreshToken> {
+        self.inner.refresh_token()
+    }
+
+    fn scopes(&self) -> Option<&Vec<oauth2::Scope>> {
+        self.inner.scopes()
+    }
+}
 
 /// A credentials struct that holds the `OAuth2` client credentials. - For
 /// [`Client`]
@@ -33,6 +88,16 @@ pub struct UrlConfig {
     pub token_url: String,
     pub redirect_url: String,
     pub profile_url: String,
+    /// Optional URL to fetch user emails (e.g., GitHub's /user/emails endpoint).
+    /// When configured, if the profile response doesn't contain an email,
+    /// this endpoint will be called to fetch verified emails and merge into profile.
+    #[serde(default)]
+    pub email_url: Option<String>,
+    /// Default token expiry in seconds when the provider doesn't return expires_in.
+    /// GitHub, for example, doesn't return expires_in in token responses.
+    /// Defaults to None (no override). Set to e.g. 28800 (8 hours) for GitHub.
+    #[serde(default)]
+    pub default_token_expiry_seconds: Option<u64>,
     pub scopes: Vec<String>,
 }
 
@@ -61,6 +126,10 @@ pub struct Client {
     >,
     /// [`Url`] instance for the `OAuth2` client's profile URL.
     pub profile_url: url::Url,
+    /// Optional [`Url`] for fetching user emails when profile doesn't have one.
+    pub email_url: Option<url::Url>,
+    /// Default token expiry when provider doesn't return expires_in.
+    pub default_token_expiry: Option<std::time::Duration>,
     /// [`reqwest::Client`] instance for the `OAuth2` client's HTTP client.
     pub http_client: reqwest::Client,
     /// A flow states hashMap <CSRF Token, (PKCE Code Verifier, Created time)>
@@ -123,6 +192,13 @@ impl Client {
             .set_token_uri_option(token_url)
             .set_redirect_uri(redirect_url);
         let profile_url = url::Url::parse(&config.profile_url)?;
+        let email_url = config
+            .email_url
+            .map(|u| url::Url::parse(&u))
+            .transpose()?;
+        let default_token_expiry = config
+            .default_token_expiry_seconds
+            .map(std::time::Duration::from_secs);
         let scopes = config
             .scopes
             .iter()
@@ -131,6 +207,8 @@ impl Client {
         Ok(Self {
             oauth2,
             profile_url,
+            email_url,
+            default_token_expiry,
             http_client: reqwest::Client::new(),
             flow_states: HashMap::new(),
             scopes,
@@ -336,7 +414,7 @@ pub trait GrantTrait: Send + Sync {
         code: String,
         state: String,
         csrf_token: String,
-    ) -> OAuth2ClientResult<(BasicTokenResponse, Response)> {
+    ) -> OAuth2ClientResult<(TokenResponseWithDefaults, Response)> {
         let client = self.get_authorization_code_client();
         // Clear outdated flow states
         client.remove_expire_flow();
@@ -352,23 +430,115 @@ pub trait GrantTrait: Send + Sync {
             Some(item) => item,
         };
         // Exchange the code with a token
-        let token = client
+        let raw_token = client
             .oauth2
             .exchange_code(AuthorizationCode::new(code))?
             .set_pkce_verifier(pkce_verifier)
             .request_async(&oauth2::reqwest::Client::new())
             .await?;
-        let profile = client
+        // Wrap token with default expiry for providers that don't return expires_in
+        let token = TokenResponseWithDefaults::new(raw_token, client.default_token_expiry);
+        let access_token = token.access_token().secret().to_owned();
+        let profile_response = client
             .http_client
             .get(client.profile_url.clone())
-            .bearer_auth(token.access_token().secret().to_owned())
+            .bearer_auth(&access_token)
             .header("User-Agent", "reqwest")
             .header("Accept", "application/json")
-            .header("Content-Type", "application/json")  
+            .header("Content-Type", "application/json")
             .send()
             .await
             .map_err(OAuth2ClientError::ProfileError)?;
-        Ok((token, profile))
+
+        // If email_url is configured, check if profile has email and fetch if needed
+        if let Some(email_url) = &client.email_url {
+            let profile_bytes = profile_response
+                .bytes()
+                .await
+                .map_err(OAuth2ClientError::ProfileError)?;
+
+            // Try to parse profile as JSON to check for email
+            if let Ok(mut profile_json) =
+                serde_json::from_slice::<serde_json::Value>(&profile_bytes)
+            {
+                let has_email = profile_json
+                    .get("email")
+                    .map(|v| !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                    .unwrap_or(false);
+
+                if !has_email {
+                    // Fetch emails from email_url
+                    if let Ok(emails_response) = client
+                        .http_client
+                        .get(email_url.clone())
+                        .bearer_auth(&access_token)
+                        .header("User-Agent", "reqwest")
+                        .header("Accept", "application/json")
+                        .send()
+                        .await
+                    {
+                        if let Ok(emails_bytes) = emails_response.bytes().await {
+                            // Try to parse as array of email objects (GitHub format)
+                            if let Ok(emails) =
+                                serde_json::from_slice::<Vec<serde_json::Value>>(&emails_bytes)
+                            {
+                                // Find primary verified email, or any verified email
+                                let email = emails
+                                    .iter()
+                                    .find(|e| {
+                                        e.get("primary")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                            && e.get("verified")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false)
+                                    })
+                                    .or_else(|| {
+                                        emails.iter().find(|e| {
+                                            e.get("verified")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .and_then(|e| e.get("email"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+
+                                if let Some(email) = email {
+                                    // Merge email into profile JSON
+                                    if let Some(obj) = profile_json.as_object_mut() {
+                                        obj.insert(
+                                            "email".to_string(),
+                                            serde_json::Value::String(email),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Create a mock response with the (potentially modified) profile JSON
+                let modified_body = serde_json::to_vec(&profile_json)
+                    .map_err(|e| OAuth2ClientError::ProfileProcessingError(e.to_string()))?;
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "application/json")
+                    .body(modified_body)
+                    .map_err(|e| OAuth2ClientError::ProfileProcessingError(e.to_string()))?;
+                return Ok((token, response.into()));
+            }
+
+            // If we couldn't parse as JSON, return original bytes as response
+            let response = http::Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(profile_bytes.to_vec())
+                .map_err(|e| OAuth2ClientError::ProfileProcessingError(e.to_string()))?;
+            return Ok((token, response.into()));
+        }
+
+        Ok((token, profile_response))
     }
 }
 
@@ -473,6 +643,8 @@ mod tests {
             token_url: settings.token_url.to_string(),
             redirect_url: settings.redirect_url.to_string(),
             profile_url: settings.profile_url.to_string(),
+            email_url: None,
+            default_token_expiry_seconds: None,
             scopes: vec![settings.scope.to_string()],
         };
         let cookie_config = CookieConfig {
