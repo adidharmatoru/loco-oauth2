@@ -226,6 +226,20 @@ impl Client {
         self.flow_states
             .retain(|_, (_, created_at)| created_at.elapsed() < self.csrf_token_timeout);
     }
+    /// Set a new redirect URL dynamically.
+    /// This is useful when supporting multiple redirect origins
+    /// (e.g., localhost for development and production domain).
+    /// # Arguments
+    /// * `url` - A string slice containing the new redirect URL.
+    /// # Example
+    /// ```rust,ignore
+    /// client.set_redirect_url("http://localhost:8000/api/auth/oauth2/google/callback");
+    /// ```
+    pub fn set_redirect_url(&mut self, url: &str) {
+        if let Ok(redirect_url) = RedirectUrl::new(url.to_string()) {
+            self.oauth2 = self.oauth2.clone().set_redirect_uri(redirect_url);
+        }
+    }
     /// Compare two strings in constant time to prevent timing attacks.
     /// # Arguments
     /// * `a` - A string to compare.
